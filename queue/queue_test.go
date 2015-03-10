@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/satori/go.uuid"
 	"github.com/syndtr/goleveldb/leveldb"
 )
 
@@ -15,7 +16,7 @@ var (
 )
 
 func Test_Queue_Enqueue_Default(t *testing.T) {
-	ResetDBs(t)
+	ResetDBs()
 
 	q := Queue{
 		DefaultCh:  make(chan Item, 1),
@@ -46,7 +47,7 @@ func Test_Queue_Enqueue_Default(t *testing.T) {
 }
 
 func Test_Queue_Enqueue_Filled(t *testing.T) {
-	ResetDBs(t)
+	ResetDBs()
 
 	q := Queue{
 		DefaultCh:  make(chan Item),
@@ -77,7 +78,7 @@ func Test_Queue_Enqueue_Filled(t *testing.T) {
 }
 
 func Test_Queue_Dequeue(t *testing.T) {
-	ResetDBs(t)
+	ResetDBs()
 
 	q := Queue{
 		DefaultCh:  make(chan Item, 1),
@@ -109,7 +110,7 @@ func Test_Queue_Dequeue(t *testing.T) {
 }
 
 func Test_Queue_Completed(t *testing.T) {
-	ResetDBs(t)
+	ResetDBs()
 
 	q := Queue{
 		DefaultDB: db1,
@@ -133,7 +134,7 @@ func Test_Queue_Completed(t *testing.T) {
 }
 
 func Test_Queue_loadDefaultItems(t *testing.T) {
-	ResetDBs(t)
+	ResetDBs()
 
 	q := Queue{
 		DefaultCh: make(chan Item, 2),
@@ -168,7 +169,7 @@ func Test_Queue_loadDefaultItems(t *testing.T) {
 }
 
 func Test_Queue_recoverOverflowItems(t *testing.T) {
-	ResetDBs(t)
+	ResetDBs()
 
 	sleep := 100 * time.Millisecond
 
@@ -221,25 +222,105 @@ func Test_Queue_recoverOverflowItems(t *testing.T) {
 	}
 }
 
-// -------------------------------------------------------------------------- //
+func Benchmark_Queue_Enqueue(b *testing.B) {
+	ResetDBs()
 
-func ResetDBs(t *testing.T) {
-	db1 = ResetDB("/tmp/db1", t)
-	db2 = ResetDB("/tmp/db2", t)
+	q := Queue{
+		DefaultCh:  make(chan Item, 1),
+		DefaultDB:  db1,
+		OverflowDB: db2,
+	}
+
+	value := []byte("test-value")
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		q.Enqueue(value)
+	}
 }
 
-func ResetDB(path string, t *testing.T) *leveldb.DB {
+func Benchmark_Queue_Dequeue_DefaultCh(b *testing.B) {
+	ResetDBs()
+
+	q := Queue{
+		DefaultCh:  make(chan Item, b.N),
+		OverflowCh: make(chan Item),
+	}
+
+	for i := 0; i < b.N; i++ {
+		q.DefaultCh <- Item{Key: []byte("k1")}
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		q.Dequeue()
+	}
+}
+
+func Benchmark_Queue_Dequeue_OverflowDB(b *testing.B) {
+	ResetDBs()
+
+	q := Queue{
+		DefaultDB:  db1,
+		OverflowDB: db2,
+		DefaultCh:  make(chan Item),
+		OverflowCh: make(chan Item),
+	}
+
+	for i := 0; i < b.N; i++ {
+		key := uuid.NewV4().Bytes()
+		q.OverflowDB.Put(key, []byte("v1"), nil)
+	}
+
+	db2k, _ := AllItems(q.OverflowDB)
+	if len(db2k) != b.N {
+		b.Error("Number of items in default db should be N")
+	}
+
+	stopRecovery := make(chan bool)
+	go q.recoverOverflowItems(stopRecovery)
+
+	b.ResetTimer()
+	b.SetParallelism(128)
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			q.Dequeue()
+		}
+	})
+	// for i := 0; i < b.N; i++ {
+	// 	q.Dequeue()
+	// }
+
+	db2k, _ = AllItems(q.OverflowDB)
+	if len(db2k) != 0 {
+		b.Error("Number of items in default db should be 0")
+	}
+
+	db1k, _ := AllItems(q.DefaultDB)
+	if len(db1k) != b.N {
+		b.Error("Number of items in default db should be N")
+	}
+
+	stopRecovery <- true
+}
+
+// -------------------------------------------------------------------------- //
+
+func ResetDBs() {
+	db1 = ResetDB("/tmp/db1")
+	db2 = ResetDB("/tmp/db2")
+}
+
+func ResetDB(path string) *leveldb.DB {
 	if err := os.RemoveAll(path); err != nil {
-		t.Error("Could not reset " + path)
+		panic("Could not reset " + path)
 	}
 
 	if db, err := leveldb.OpenFile(path, nil); err != nil {
-		t.Error("Could not create " + path)
+		panic("Could not create " + path)
 	} else {
 		return db
 	}
-
-	return nil
 }
 
 func AllItems(db *leveldb.DB) (keys, values [][]byte) {
